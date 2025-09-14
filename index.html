@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>micro:bit スタンプラリー（ブラウザ版）</title>
+  <style>
+    :root{font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;}
+    body{max-width:900px;margin:24px auto;padding:18px;line-height:1.5}
+    h1{font-size:1.4rem;margin-bottom:6px}
+    .card{border:1px solid #ddd;padding:12px;border-radius:8px;margin-bottom:12px;box-shadow:0 2px 6px rgba(0,0,0,0.03)}
+    button{padding:10px 14px;border-radius:8px;border:1px solid #888;background:#fff;cursor:pointer}
+    #stamps{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+    .stamp{background:#f6f6f6;border-radius:8px;padding:8px 10px;border:1px solid #e0e0e0}
+    .stamp.duplicate{opacity:.6}
+    small{color:#666}
+    .danger{color:#a00}
+    footer{margin-top:18px;font-size:0.9rem;color:#444}
+    .log{max-height:180px;overflow:auto;padding:8px;background:#fff;border-radius:6px;border:1px dashed #ccc}
+  </style>
+</head>
+<body>
+  <h1>micro:bit スタンプラリー（ブラウザ）</h1>
+  <div class="card">
+    <strong>使い方（短縮）</strong>
+    <ol>
+      <li>Android: Chromeでこのページを開く</li>
+      <li>iPhone: <strong>Bluefy</strong>などWeb Bluetooth対応ブラウザで開く（事前インストール）</li>
+      <li>店舗のmicro:bitと接続して、店舗の方にmicro:bitのボタンを押してもらう</li>
+      <li>受信した店舗IDがスタンプとして記録されます（ローカル保存）</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;gap:8px;align-items:center">
+      <button id="btnConnect">micro:bit に接続</button>
+      <button id="btnDisconnect" disabled>切断</button>
+      <div style="margin-left:auto"><small id="status">未接続</small></div>
+    </div>
+    <div style="margin-top:10px">
+      <label>フィルタ（任意）: <input id="nameFilter" placeholder="例: BBC micro:bit" /></label>
+      <div><small>※ そのまま空欄で問題ありません。</small></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>受信ログ</strong>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card">
+    <strong>スタンプ帳</strong>
+    <div id="stamps"></div>
+    <div style="margin-top:10px">
+      <button id="btnClear">スタンプを消す</button>
+    </div>
+  </div>
+
+  <footer>
+    <div><small>注意: iPhoneで標準のSafariはWeb Bluetooth非対応です。Bluefyなどを事前にインストールしてください。</small></div>
+  </footer>
+
+  <script>
+    // Nordic UART service/characteristic UUIDs
+    const UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+    const UART_TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // device -> client (notify)
+
+    const btnConnect = document.getElementById('btnConnect');
+    const btnDisconnect = document.getElementById('btnDisconnect');
+    const logEl = document.getElementById('log');
+    const stampsEl = document.getElementById('stamps');
+    const btnClear = document.getElementById('btnClear');
+    const statusEl = document.getElementById('status');
+    const nameFilter = document.getElementById('nameFilter');
+
+    let device = null;
+    let server = null;
+    let txChar = null;
+
+    // load stamps from localStorage
+    let stamps = JSON.parse(localStorage.getItem('mb_stamps_v1') || '[]');
+    renderStamps();
+
+    function log(s, cls) {
+      const d = document.createElement('div');
+      d.textContent = (new Date()).toLocaleTimeString() + ' — ' + s;
+      if (cls) d.classList.add(cls);
+      logEl.prepend(d);
+    }
+
+    function saveStamps() {
+      localStorage.setItem('mb_stamps_v1', JSON.stringify(stamps));
+    }
+
+    function addStamp(id) {
+      const existing = stamps.find(s => s.id === id);
+      if (existing) {
+        log('既に取得済み: ' + id, 'duplicate');
+        renderStamps();
+        return false;
+      }
+      const stamp = { id, at: new Date().toISOString() };
+      stamps.push(stamp);
+      saveStamps();
+      log('スタンプ獲得: ' + id);
+      renderStamps();
+      return true;
+    }
+
+    function renderStamps() {
+      stampsEl.innerHTML = '';
+      if (!stamps.length) {
+        stampsEl.innerHTML = '<small>まだスタンプがありません。</small>';
+        return;
+      }
+      stamps.forEach(s => {
+        const el = document.createElement('div');
+        el.className = 'stamp';
+        el.innerHTML = `<strong>${escapeHtml(s.id)}</strong><div><small>${new Date(s.at).toLocaleString()}</small></div>`;
+        stampsEl.appendChild(el);
+      });
+    }
+
+    function escapeHtml(s){ return String(s).replace(/[&<>"']/g, (c)=>({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c])); }
+
+    btnClear.addEventListener('click', ()=>{
+      if (!confirm('スタンプをすべて消します。よろしいですか？')) return;
+      stamps = [];
+      saveStamps();
+      renderStamps();
+      log('スタンプをクリアしました。');
+    });
+
+    btnConnect.addEventListener('click', async ()=>{
+      try {
+        if (!navigator.bluetooth) { alert('Web Bluetooth がこのブラウザで利用できません。Bluefyなどの対応ブラウザをお使いください。'); return; }
+
+        statusEl.textContent = 'デバイス選択中…';
+
+        const filters = [];
+        const namePref = nameFilter.value && nameFilter.value.trim();
+        if (namePref) filters.push({ namePrefix: namePref });
+
+        // If no filters, allow all devices but require UART service
+        const options = filters.length ? { filters, optionalServices: [UART_SERVICE] } : { acceptAllDevices: true, optionalServices: [UART_SERVICE] };
+
+        device = await navigator.bluetooth.requestDevice(options);
+        log('選択: ' + device.name || device.id);
+        statusEl.textContent = '接続中…';
+
+        device.addEventListener('gattserverdisconnected', onDisconnected);
+
+        server = await device.gatt.connect();
+        const service = await server.getPrimaryService(UART_SERVICE);
+        txChar = await service.getCharacteristic(UART_TX_CHAR);
+
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', handleNotifications);
+
+        statusEl.textContent = '接続済み: ' + (device.name || device.id);
+        btnDisconnect.disabled = false;
+
+        log('micro:bit に接続しました。ボタンを押して店舗IDを送信してください。');
+
+      } catch (err) {
+        console.error(err);
+        alert('接続に失敗しました: ' + (err && err.message ? err.message : err));
+        statusEl.textContent = '未接続';
+      }
+    });
+
+    btnDisconnect.addEventListener('click', async ()=>{
+      if (!device) return;
+      try { if (txChar) await txChar.stopNotifications(); } catch(e){}
+      try { device.gatt.disconnect(); } catch(e){}
+      onDisconnected();
+    });
+
+    function onDisconnected() {
+      statusEl.textContent = '未接続';
+      btnDisconnect.disabled = true;
+      log('切断されました。');
+      device = null; server = null; txChar = null;
+    }
+
+    function handleNotifications(evt) {
+      const value = evt.target.value;
+      const decoder = new TextDecoder('utf-8');
+      const text = decoder.decode(value);
+      // micro:bit から送られてくる文字列は改行や余分な空白を含む可能性がある
+      const id = text.trim();
+      if (!id) { log('空のメッセージを受信'); return; }
+      log('受信: ' + id);
+      addStamp(id);
+    }
+
+    // Auto reconnect hint: if page is closed we remove references
+    window.addEventListener('unload', ()=>{
+      try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch(e){}
+    });
+
+  </script>
+</body>
+</html>
